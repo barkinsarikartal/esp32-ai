@@ -39,9 +39,23 @@ typedef struct {
   /* Optional int8 staging: nibbles unpacked and group scales converted once, so
    * each matvec skips both. Numerics are unchanged - same codes, same scales,
    * same group sums. NULL selects the int4 path. */
-  const int8_t *w8;        // rows*cols, values -7..7
+  const int8_t *w8;        // rows*stride8, values -7..7; padding bytes are 0
   const float  *scale8;    // rows*n_groups, half2float'd once
+  int stride8;             // bytes per staged row: cols rounded up to
+                           // LLM_STAGE_ALIGN, so a SIMD kernel can read whole
+                           // vectors without a tail case
 } QT;
+
+/* Staged rows are padded to this many bytes. 1 keeps rows contiguous, which
+ * is what the host verifier and the scalar kernel need nothing more than; a
+ * platform with 16-byte vector loads defines 16 before including this file
+ * and allocates staging buffers with matching alignment. */
+#ifndef LLM_STAGE_ALIGN
+#define LLM_STAGE_ALIGN 1
+#endif
+static inline int llm_stage_stride(int cols) {
+  return (cols + LLM_STAGE_ALIGN - 1) / LLM_STAGE_ALIGN * LLM_STAGE_ALIGN;
+}
 
 // IEEE half -> float.
 static inline float half2float(uint16_t h) {
@@ -98,6 +112,7 @@ static const uint8_t *bind_q(const uint8_t *p, QT *t, int rows, int cols) {
   t->codes = p;  p += (size_t)rows * t->row_bytes;
   t->scales = (const uint16_t *)p;  p += (size_t)rows * t->n_groups * 2;
   t->w8 = NULL; t->scale8 = NULL;   // int4 path until staged
+  t->stride8 = 0;
   return p;
 }
 static const uint8_t *bind_f(const uint8_t *p, const float **t, int n) {
@@ -225,9 +240,9 @@ __attribute__((noinline))
 #endif
 static void matvec_i8_range(const QT *t, const int8_t *xq, float x_scale,
                             float *y, int row_begin, int row_end) {
-  int g = t->group, ng = t->n_groups, cols = t->cols;
+  int g = t->group, ng = t->n_groups, cols = t->cols, stride = t->stride8;
   for (int r = row_begin; r < row_end; r++) {
-    const int8_t *w = t->w8 + (size_t)r * cols;
+    const int8_t *w = t->w8 + (size_t)r * stride;
     const float *sc = t->scale8 + (size_t)r * ng;
     float acc = 0.f;
     for (int gi = 0; gi < ng; gi++) {
@@ -358,7 +373,7 @@ static int llm_load(const uint8_t *base, Model *m) {
 /* Byte offset of the float scale array in a staged buffer. rows*cols need not
  * be a multiple of 4, so the offset is rounded up to keep the float* aligned. */
 static inline size_t llm_stage_scale_offset(const QT *t) {
-  size_t w_bytes = (size_t)t->rows * t->cols * sizeof(int8_t);
+  size_t w_bytes = (size_t)t->rows * llm_stage_stride(t->cols) * sizeof(int8_t);
   return (w_bytes + sizeof(float) - 1) & ~(size_t)(sizeof(float) - 1);
 }
 
@@ -370,20 +385,23 @@ static inline size_t llm_stage_int8_bytes(const QT *t) {
 static inline void llm_stage_int8(QT *t, void *buffer) {
   int8_t *w = (int8_t *)buffer;
   float *sc = (float *)((uint8_t *)buffer + llm_stage_scale_offset(t));
+  int stride = llm_stage_stride(t->cols);
   for (int r = 0; r < t->rows; r++) {
     const uint8_t *row = t->codes + (size_t)r * t->row_bytes;
-    int8_t *dst = w + (size_t)r * t->cols;
+    int8_t *dst = w + (size_t)r * stride;
     for (int j = 0; j < t->cols; j++) {
       uint8_t byte = row[j >> 1];
       int code = (j & 1) ? (byte >> 4) : (byte & 0xF);
       dst[j] = (int8_t)(code - 8);
     }
+    for (int j = t->cols; j < stride; j++) dst[j] = 0;
     for (int gi = 0; gi < t->n_groups; gi++)
       sc[(size_t)r * t->n_groups + gi] =
           half2float(t->scales[(size_t)r * t->n_groups + gi]);
   }
   t->w8 = w;
   t->scale8 = sc;
+  t->stride8 = stride;
 }
 
 /* Stage every per-position tensor, one allocation per tensor: a multi-megabyte
