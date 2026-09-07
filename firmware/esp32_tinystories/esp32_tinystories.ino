@@ -34,6 +34,11 @@
 // vector kernel reads whole vectors; every other target keeps rows packed.
 #if CONFIG_IDF_TARGET_ESP32P4
 #define LLM_STAGE_ALIGN 16
+// Attention on the quantized KV cache, with both passes as PIE vector dots.
+#define LLM_KV_QUANT 1
+#include "../../runtime/llm_pie_dot.h"
+#define LLM_DOT_S8V  llm_pie_dot_s8v
+#define LLM_DOT_S16V llm_pie_dot_s16v
 #endif
 #include "../../runtime/llm.h"
 #include "../../runtime/llm_pie.h"
@@ -172,9 +177,28 @@ static bool pie_self_check() {
       if (d > worst) worst = d;
     }
   }
-  Serial.printf("pie self-check: max |vector - scalar| = %g -> %s\n", worst,
-                worst == 0 ? "ok" : "FAIL");
-  return worst == 0;
+  // The attention dots, including the 40-bit read of the int16 accumulator:
+  // extreme values first, then a pseudo-random fill, against the scalar sums.
+  static int8_t a8[256] __attribute__((aligned(16))), b8[256] __attribute__((aligned(16)));
+  static int16_t a16[256] __attribute__((aligned(16))), b16[256] __attribute__((aligned(16)));
+  int dot_bad = 0;
+  for (int pass = 0; pass < 2; pass++) {
+    uint32_t r = 0x9E3779B9u ^ pass;
+    for (int i = 0; i < 256; i++) {
+      r ^= r << 13; r ^= r >> 17; r ^= r << 5;
+      a8[i] = pass ? (int8_t)(r % 255) - 127 : (i & 1 ? 127 : -127);
+      b8[i] = pass ? (int8_t)((r >> 8) % 255) - 127 : 127;
+      a16[i] = pass ? (int16_t)(r % 65535) - 32767 : (i & 1 ? 32767 : -32767);
+      b16[i] = pass ? (int16_t)((r >> 16) % 65535) - 32767 : (i & 1 ? 32767 : 32767);
+    }
+    for (int nvec = 1; nvec <= 16; nvec++) {
+      if (llm_pie_dot_s8v(a8, b8, nvec) != llm_dot_s8v_scalar(a8, b8, nvec)) dot_bad++;
+      if (llm_pie_dot_s16v(a16, b16, nvec) != llm_dot_s16v_scalar(a16, b16, nvec)) dot_bad++;
+    }
+  }
+  Serial.printf("pie self-check: matvec max |vector - scalar| = %g, dot mismatches %d -> %s\n",
+                worst, dot_bad, (worst == 0 && dot_bad == 0) ? "ok" : "FAIL");
+  return worst == 0 && dot_bad == 0;
 }
 #endif
 
@@ -217,9 +241,15 @@ static void alloc_scratch() {
   // logits: out_vocab floats, 99 KiB here, read once per token. Left in PSRAM
   // rather than spend a fifth of internal SRAM on it.
   s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
+#ifdef LLM_KV_QUANT
+  // Quantized KV cache: int8 keys, int16 transposed values, about 540 KB.
+  llm_kv_quant_bind(&model, &s, ps_or_die(llm_kv_quant_bytes(&model), "kv cache"));
+  s.kcache = s.vcache = NULL;
+#else
   // KV cache: 1.1MB, read once per position rather than per matvec.
   s.kcache = (float *)ps_or_die((size_t)L * S * D * 4, "kcache");
   s.vcache = (float *)ps_or_die((size_t)L * S * D * 4, "vcache");
+#endif
 }
 
 static void blink(uint8_t g) {
@@ -430,8 +460,13 @@ void setup() {
   Serial.printf("free: sram %.0f KB | psram %.2f MB\n",
                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024.0,
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1048576.0);
-  Serial.printf("sampling: temperature %.2f, top-k %d | matvec kernel: %s\n\n",
-                TEMPERATURE, TOP_K, LLM_HAVE_PIE ? "PIE vector" : "scalar");
+#ifdef LLM_KV_QUANT
+  const char *kv_mode = "int8 keys / int16 values, vector dots";
+#else
+  const char *kv_mode = "fp32";
+#endif
+  Serial.printf("sampling: temperature %.2f, top-k %d | matvec: %s | kv cache: %s\n\n",
+                TEMPERATURE, TOP_K, LLM_HAVE_PIE ? "PIE vector" : "scalar", kv_mode);
   Serial.println("type a story prompt and press return.");
   // A UART bridge can deliver a glitch byte around reset. Anything received
   // before this point is not a prompt, so drop it rather than let it poison

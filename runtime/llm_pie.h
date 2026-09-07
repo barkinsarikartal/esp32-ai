@@ -21,36 +21,10 @@
 #include <stdint.h>
 #include "llm.h"
 
-#if defined(__riscv) && defined(CONFIG_IDF_TARGET_ESP32P4)
-#define LLM_HAVE_PIE 1
+#include "llm_pie_dot.h"
 
-// Dot product of nvec 16-byte vectors; nvec >= 1, pointers 16-byte aligned.
-// The PIE instructions encode only registers x8-x15 and x24-x31, so the
-// operands are pinned to a2-a5 rather than left to the register allocator.
-static inline int32_t llm_pie_dot(const int8_t *w_in, const int8_t *x_in, int nvec) {
-  register const int8_t *w __asm__("a2") = w_in;
-  register const int8_t *x __asm__("a3") = x_in;
-  register int n __asm__("a4") = nvec - 1;
-  register int32_t acc __asm__("a5");
-  __asm__ volatile(
-    "esp.zero.xacc\n"
-    "esp.vld.128.ip q0, %[w], 16\n"
-    "esp.vld.128.ip q1, %[x], 16\n"
-    "beqz %[n], 2f\n"
-    "1:\n"
-    // XACC += q0 . q1 using the values loaded so far, then q0 <- next weights.
-    "esp.vmulas.s8.xacc.ld.ip q0, %[w], 16, q0, q1\n"
-    "esp.vld.128.ip q1, %[x], 16\n"
-    "addi %[n], %[n], -1\n"
-    "bnez %[n], 1b\n"
-    "2:\n"
-    "esp.vmulas.s8.xacc q0, q1\n"
-    "esp.movx.r.xacc.l %[acc]\n"
-    : [acc] "=&r"(acc), [w] "+&r"(w), [x] "+&r"(x), [n] "+&r"(n)
-    :
-    : "memory");
-  return acc;
-}
+#if LLM_HAVE_PIE
+#define llm_pie_dot llm_pie_dot_s8v
 
 // Drop-in for matvec_i8_range on a staged tensor that meets the requirements.
 static void matvec_pie_range(const QT *t, const int8_t *xq, float x_scale,
@@ -76,8 +50,6 @@ static inline int llm_pie_ok(const QT *t) {
   return t->w8 != NULL && (t->stride8 % 16) == 0 && (t->group % 16) == 0 &&
          (((uintptr_t)t->w8) & 15) == 0;
 }
-#else
-#define LLM_HAVE_PIE 0
 #endif
 
 #endif
