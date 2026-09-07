@@ -563,6 +563,12 @@ void setup() {
                   (unsigned)(sram_used + STATIC_SRAM_BYTES),
                   psram_used / 1048576.0);
   }
+#ifdef CPU_MHZ
+  // Requested explicitly, over the board file's F_CPU. The HAL reports whether
+  // it accepted the value; the line below shows what the chip actually runs.
+  Serial.printf("cpu: request %d MHz -> %s\n", CPU_MHZ, setCpuFrequencyMhz(CPU_MHZ) ? "accepted" : "rejected");
+#endif
+  Serial.printf("cpu: %u MHz, %d cores\n", (unsigned)getCpuFrequencyMhz(), (int)portNUM_PROCESSORS);
   Serial.printf("free: sram %.0f KB | psram %.2f MB\n",
                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024.0,
                 heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1048576.0);
