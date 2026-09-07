@@ -73,23 +73,56 @@ static inline void llm_pie4_prepare(const int8_t *xq, int cols, int group,
   }
 }
 
+static inline void llm_pie4_row(const QT *t, const int8_t *xperm, const int32_t *xsum8,
+                                float x_scale, float *y, int r) {
+  int g = t->group, ng = t->n_groups, cols = t->cols;
+  const uint8_t *w = t->w4 + (size_t)r * t->stride4;
+  const float *sc = t->scale8 + (size_t)r * ng;
+  float acc = 0.f;
+  for (int gi = 0; gi < ng; gi++) {
+    int begin = gi * g, span = cols - begin;
+    if (span > g) span = g;
+    int32_t d = llm_pie_dot4(w + begin / 2, xperm + begin, span / 32, llm_pie4_mask)
+                - xsum8[gi];
+    acc += (float)d * sc[gi];
+  }
+  y[r] = acc * x_scale;
+}
+
 // Same result as matvec_q8_range on the flash codes, and as matvec_i8_range.
+//
+// The compute per row is a few dozen instructions; the time is the cache
+// misses on the packed rows in PSRAM. A platform with a cache preload engine
+// defines LLM_PRELOAD_START(addr, bytes) and LLM_PRELOAD_END() before
+// including this file: the rows are then taken in chunks of LLM_PRELOAD_BYTES
+// and each chunk's successor is requested before the chunk is computed, so
+// the engine streams the weights while the vector unit works on the previous
+// chunk. START may block until the engine is free.
 static void matvec_pie4_range(const QT *t, const int8_t *xperm, const int32_t *xsum8,
                               float x_scale, float *y, int row_begin, int row_end) {
-  int g = t->group, ng = t->n_groups, cols = t->cols, stride = t->stride4;
-  for (int r = row_begin; r < row_end; r++) {
-    const uint8_t *w = t->w4 + (size_t)r * stride;
-    const float *sc = t->scale8 + (size_t)r * ng;
-    float acc = 0.f;
-    for (int gi = 0; gi < ng; gi++) {
-      int begin = gi * g, span = cols - begin;
-      if (span > g) span = g;
-      int32_t d = llm_pie_dot4(w + begin / 2, xperm + begin, span / 32, llm_pie4_mask)
-                  - xsum8[gi];
-      acc += (float)d * sc[gi];
-    }
-    y[r] = acc * x_scale;
+#ifdef LLM_PRELOAD_START
+  int stride = t->stride4;
+  int chunk = LLM_PRELOAD_BYTES / stride;
+  if (chunk < 1) chunk = 1;
+  if (row_begin < row_end) {
+    int r1 = row_begin + chunk;
+    if (r1 > row_end) r1 = row_end;
+    LLM_PRELOAD_START(t->w4 + (size_t)row_begin * stride, (size_t)(r1 - row_begin) * stride);
   }
+  for (int r0 = row_begin; r0 < row_end; r0 += chunk) {
+    int r1 = r0 + chunk;
+    if (r1 > row_end) r1 = row_end;
+    if (r1 < row_end) {
+      int r2 = r1 + chunk;
+      if (r2 > row_end) r2 = row_end;
+      LLM_PRELOAD_START(t->w4 + (size_t)r1 * stride, (size_t)(r2 - r1) * stride);
+    }
+    for (int r = r0; r < r1; r++) llm_pie4_row(t, xperm, xsum8, x_scale, y, r);
+  }
+  LLM_PRELOAD_END();
+#else
+  for (int r = row_begin; r < row_end; r++) llm_pie4_row(t, xperm, xsum8, x_scale, y, r);
+#endif
 }
 
 static inline int llm_pie4_ok(const QT *t) {

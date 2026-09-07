@@ -41,6 +41,54 @@
 #define LLM_DOT_S16V llm_pie_dot_s16v
 #endif
 #include "../../runtime/llm.h"
+#if CONFIG_IDF_TARGET_ESP32P4
+// The head is bound by PSRAM latency, not compute: ask the L1 data cache's
+// preload engine for the next block of rows while the current one computes.
+// One engine serves both cores, so requests are serialised with a spinlock
+// and a core waits for the engine to be idle before handing it a block.
+#include "esp32p4/rom/cache.h"
+// HEAD_PRELOAD: 0 none, 1 the L1 data cache engine (64 KB cache), 2 the L2
+// engine (256 KB cache). HEAD_PRELOAD_BYTES is the block requested ahead.
+#ifndef HEAD_PRELOAD
+#define HEAD_PRELOAD 1
+#endif
+#ifndef HEAD_PRELOAD_BYTES
+#define HEAD_PRELOAD_BYTES 8192
+#endif
+#if HEAD_PRELOAD == 1
+#define PRELOAD_DONE()          Cache_L1_DCache_Preload_Done()
+#define PRELOAD_START(a, n)     Cache_Start_L1_DCache_Preload((a), (n), 0)
+#define PRELOAD_END(auto_)      Cache_End_L1_DCache_Preload(auto_)
+#elif HEAD_PRELOAD == 2
+#define PRELOAD_DONE()          Cache_L2_Cache_Preload_Done()
+#define PRELOAD_START(a, n)     Cache_Start_L2_Cache_Preload((a), (n), 0)
+#define PRELOAD_END(auto_)      Cache_End_L2_Cache_Preload(auto_)
+#endif
+#if HEAD_PRELOAD
+static portMUX_TYPE preload_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t preload_autoload = 1;
+static inline void head_preload_start(const void *addr, size_t bytes) {
+  for (;;) {
+    portENTER_CRITICAL(&preload_mux);
+    if (PRELOAD_DONE()) {
+      preload_autoload = PRELOAD_START((uint32_t)(uintptr_t)addr, bytes);
+      portEXIT_CRITICAL(&preload_mux);
+      return;
+    }
+    portEXIT_CRITICAL(&preload_mux);
+  }
+}
+static inline void head_preload_end(void) {
+  while (!PRELOAD_DONE()) { }
+  portENTER_CRITICAL(&preload_mux);
+  PRELOAD_END(preload_autoload);
+  portEXIT_CRITICAL(&preload_mux);
+}
+#define LLM_PRELOAD_BYTES HEAD_PRELOAD_BYTES
+#define LLM_PRELOAD_START(addr, bytes) head_preload_start((addr), (bytes))
+#define LLM_PRELOAD_END() head_preload_end()
+#endif
+#endif
 #include "../../runtime/llm_pie.h"
 #include "../../runtime/bpe_tokenizer.h"
 #include "generated/vocab.h"
@@ -281,12 +329,12 @@ static void alloc_scratch() {
   // rather than spend a fifth of internal SRAM on it.
   s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
 #ifdef LLM_KV_QUANT
-  // Quantized KV cache. The int8 keys (192 KB) are read for every position at
-  // every step, so they go to internal SRAM with the per-head temporaries;
-  // the int16 values and the scales (about 340 KB) stay in PSRAM.
+  // Quantized KV cache: keys, values and scales in PSRAM (the caches cover
+  // them well: keeping the keys in SRAM measured no gain, and the SRAM is
+  // better spent on the head's scale table), the per-head temporaries in SRAM.
   llm_kv_quant_bind(&model, &s,
-                    ps_or_die(llm_kv_main_bytes(&model), "kv values"),
-                    sram_or_die(llm_kv_key_bytes(&model), "kv keys"),
+                    ps_or_die(llm_kv_main_bytes(&model) + llm_kv_key_bytes(&model), "kv cache"),
+                    NULL,
                     sram_or_die(llm_kv_hot_bytes(&model), "kv temporaries"));
   s.kcache = s.vcache = NULL;
 #else
@@ -473,8 +521,10 @@ void setup() {
   // PSRAM bandwidth, so half the bytes is the win.
 #if LLM_HAVE_PIE
   if (model.out_head.cols % 32 == 0 && model.out_head.group % 32 == 0) {
-    void *b = ps_or_die(llm_stage_int4_bytes(&model.out_head), "staged head int4");
-    llm_stage_int4(&model.out_head, b);
+    // Codes in PSRAM; the per-row scales (100 KB) in SRAM, read once per row.
+    size_t code_bytes = (size_t)model.out_head.rows * model.out_head.row_bytes;
+    llm_stage_int4_split(&model.out_head, ps_or_die(code_bytes, "staged head int4"),
+                         sram_or_die(llm_stage_int4_scale_bytes(&model.out_head), "head scales"));
     ++staged;
   } else
 #endif
@@ -523,7 +573,11 @@ void setup() {
 #endif
   Serial.printf("sampling: temperature %.2f, top-k %d | matvec: %s | head: %s | kv cache: %s | attention: %s\n\n",
                 TEMPERATURE, TOP_K, LLM_HAVE_PIE ? "PIE vector" : "scalar",
+#ifdef LLM_PRELOAD_START
+                model.out_head.w4 ? "int4, vector unpack, cache preload" : "int8", kv_mode,
+#else
                 model.out_head.w4 ? "int4, vector unpack" : "int8", kv_mode,
+#endif
                 model.attn_heads ? "both cores" : "one core");
   Serial.println("type a story prompt and press return.");
   // A UART bridge can deliver a glitch byte around reset. Anything received

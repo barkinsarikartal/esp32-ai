@@ -471,6 +471,22 @@ static inline size_t llm_stage_int4_bytes(const QT *t) {
   return ((w_bytes + sizeof(float) - 1) & ~(size_t)(sizeof(float) - 1))
        + (size_t)t->rows * t->n_groups * sizeof(float);
 }
+/* The scales alone, so they can be placed apart from the codes (they are
+ * read once per row, and are small enough for fast memory). */
+static inline size_t llm_stage_int4_scale_bytes(const QT *t) {
+  return (size_t)t->rows * t->n_groups * sizeof(float);
+}
+static inline void llm_stage_int4_split(QT *t, void *codes_buf, void *scales_buf) {
+  size_t w_bytes = (size_t)t->rows * t->row_bytes;
+  uint8_t *w = (uint8_t *)codes_buf;
+  float *sc = (float *)scales_buf;
+  memcpy(w, t->codes, w_bytes);
+  for (size_t i = 0; i < (size_t)t->rows * t->n_groups; i++)
+    sc[i] = half2float(t->scales[i]);
+  t->w4 = w;
+  t->stride4 = t->row_bytes;
+  t->scale8 = sc;
+}
 static inline void llm_stage_int4(QT *t, void *buffer) {
   size_t w_bytes = (size_t)t->rows * t->row_bytes;
   uint8_t *w = (uint8_t *)buffer;
