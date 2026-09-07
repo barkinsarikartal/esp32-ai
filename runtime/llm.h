@@ -81,7 +81,10 @@ static inline float half2float(uint16_t h) {
   float out; memcpy(&out, &f, 4); return out;
 }
 
-typedef struct {
+struct Scratch;
+typedef struct Model Model;
+
+struct Model {
   Cfg c;
   QT tok_emb;             // [V, D]  input embedding
   QT out_head;            // [Vout, D]; first Vout rows of tok_emb when tied
@@ -105,7 +108,12 @@ typedef struct {
   // tied 32,768-row head and a 66-row FFN matrix have different cost profiles.
   void (*head_matvec)(const QT *, const float *, float *);
   void (*layer_matvec)(const QT *, const float *, float *);
-} Model;
+  /* Attention for one layer at one position over all heads, on the quantized
+   * KV path only. NULL runs the heads in sequence on the calling core; a
+   * platform can split them across cores with llm_attend_heads and the
+   * second scratch set (q8b, w16b, scoresb). */
+  void (*attn_heads)(Model *, struct Scratch *, int layer, int pos);
+};
 
 // Advance a cursor over the file, binding one quant tensor. Reads the per-tensor
 // group prefix, then ragged codes + fp16 scales.
@@ -383,6 +391,7 @@ static int llm_load(const uint8_t *base, Model *m) {
 
   m->head_matvec = NULL;
   m->layer_matvec = NULL;
+  m->attn_heads = NULL;
   int D = m->c.dim, L = m->c.n_layers, P = m->c.ple_dim, F = m->c.ffn, V = m->c.vocab;
 
   p = bind_q(p, &m->tok_emb, V, D);
@@ -504,7 +513,7 @@ static inline int llm_core_stage_count(const Model *m) {
 }
 
 // Scratch buffers, caller-allocated (host: malloc; device: PSRAM).
-typedef struct {
+typedef struct Scratch {
   float *x, *h, *qkv, *att, *g1, *g2, *ple, *tmpP, *trow, *logits;
   float *scores; // [seq_len], reused by each attention head
   float *kcache, *vcache; // [L * seq_len * D]; unused under LLM_KV_QUANT
@@ -515,6 +524,9 @@ typedef struct {
   float   *vs;    // [L][S][H] value scales
   int8_t  *q8;    // [LLM_KPAD] this head's query, 16-byte aligned
   int16_t *w16;   // [S] this head's softmax weights, 16-byte aligned
+  int8_t  *q8b;   // second set of the three, for a second core
+  int16_t *w16b;
+  float   *scoresb; // [S]
 #endif
 #ifdef LLM_PROFILE
   struct {
@@ -536,7 +548,8 @@ static void llm_profile_reset(Scratch *s) {
 static inline size_t llm_kv_quant_bytes(const Model *m) {
   size_t L = m->c.n_layers, S = m->c.seq_len, H = m->c.n_heads, Dh = m->c.dim / m->c.n_heads;
   return L * S * H * LLM_KPAD + L * H * Dh * S * sizeof(int16_t)
-       + 2 * L * S * H * sizeof(float) + LLM_KPAD + S * sizeof(int16_t) + 64;
+       + 2 * L * S * H * sizeof(float)
+       + 2 * (LLM_KPAD + S * sizeof(int16_t)) + S * sizeof(float) + 96;
 }
 static inline void llm_kv_quant_bind(const Model *m, Scratch *s, void *buffer) {
   size_t L = m->c.n_layers, S = m->c.seq_len, H = m->c.n_heads, Dh = m->c.dim / m->c.n_heads;
@@ -547,7 +560,62 @@ static inline void llm_kv_quant_bind(const Model *m, Scratch *s, void *buffer) {
   s->vs = (float *)p;     p += L * S * H * sizeof(float);
   p = (uint8_t *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
   s->q8 = (int8_t *)p;    p += LLM_KPAD;
-  s->w16 = (int16_t *)p;
+  s->w16 = (int16_t *)p;  p += S * sizeof(int16_t);
+  p = (uint8_t *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
+  s->q8b = (int8_t *)p;   p += LLM_KPAD;
+  s->w16b = (int16_t *)p; p += S * sizeof(int16_t);
+  s->scoresb = (float *)p;
+}
+
+/* Attention over heads h0..h1-1 of one layer at one position, on the
+ * quantized cache, with the caller's temporaries. Reads k8/v16t written for
+ * every position up to pos, writes only this range's slice of s->att, so two
+ * ranges can run at once on two cores with separate temporaries. */
+static void llm_attend_heads(Model *m, Scratch *s, int l, int pos, int h0, int h1,
+                             int8_t *q8, int16_t *w16, float *scores) {
+  int D = m->c.dim, H = m->c.n_heads, Dh = D / H, S = m->c.seq_len;
+  float scale = 1.f / sqrtf((float)Dh);
+  int nk = LLM_KPAD / 16, n16 = (pos + 1 + 7) / 8;
+  const float *q = s->qkv;
+  for (int hh = h0; hh < h1; hh++) {
+    const float *qh = q + hh * Dh;
+    float *ao = s->att + hh * Dh;
+    float qmax = 1e-8f;
+    for (int i = 0; i < Dh; i++) { float a = fabsf(qh[i]); if (a > qmax) qmax = a; }
+    float qinv = 127.f / qmax;
+    for (int i = 0; i < Dh; i++) {
+      int v8 = (int)lrintf(qh[i] * qinv);
+      q8[i] = (int8_t)(v8 > 127 ? 127 : (v8 < -127 ? -127 : v8));
+    }
+    for (int i = Dh; i < LLM_KPAD; i++) q8[i] = 0;
+    float qs = qmax / 127.f * scale;
+    const int8_t *kb = s->k8 + ((size_t)l * S * H + hh) * LLM_KPAD;
+    const float *ksb = s->ks + (size_t)l * S * H + hh;
+    const float *vsb = s->vs + (size_t)l * S * H + hh;
+    float maxs = -1e30f;
+    for (int t = 0; t <= pos; t++) {
+      float dot = (float)LLM_DOT_S8V(q8, kb + (size_t)t * H * LLM_KPAD, nk)
+                  * qs * ksb[(size_t)t * H];
+      scores[t] = dot;
+      if (dot > maxs) maxs = dot;
+    }
+    // softmax weights, each multiplied by its position's value scale, to int16
+    float denom = 0.f, wmax = 0.f;
+    for (int t = 0; t <= pos; t++) {
+      float w = expf(scores[t] - maxs);
+      denom += w;
+      float wv = w * vsb[(size_t)t * H];
+      scores[t] = wv;
+      if (wv > wmax) wmax = wv;
+    }
+    float winv = 32767.f / wmax;
+    for (int t = 0; t <= pos; t++) w16[t] = (int16_t)lrintf(scores[t] * winv);
+    for (int t = pos + 1; t < n16 * 8; t++) w16[t] = 0;
+    float os = wmax / 32767.f / denom;
+    const int16_t *vt = s->v16t + ((size_t)l * H + hh) * Dh * S;
+    for (int i = 0; i < Dh; i++)
+      ao[i] = (float)LLM_DOT_S16V(vt + (size_t)i * S, w16, n16) * os;
+  }
 }
 #endif
 
@@ -607,7 +675,6 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
         kh[i] = k1 * c - k2 * sn; kh[i + Dh / 2] = k2 * c + k1 * sn;
       }
     }
-    float scale = 1.f / sqrtf((float)Dh);
 #ifdef LLM_KV_QUANT
     // ---- quantized cache: store this position's k (int8) and v (int16)
     for (int hh = 0; hh < H; hh++) {
@@ -635,50 +702,14 @@ static void llm_forward(Model *m, int token, int pos, Scratch *s) {
       s->vs[slot] = vmax / 32767.f;
     }
     // ---- causal attention over 0..pos, both passes as vector dots
-    int nk = LLM_KPAD / 16, n16 = (pos + 1 + 7) / 8;
-    for (int hh = 0; hh < H; hh++) {
-      float *qh = q + hh * Dh, *ao = s->att + hh * Dh;
-      float qmax = 1e-8f;
-      for (int i = 0; i < Dh; i++) { float a = fabsf(qh[i]); if (a > qmax) qmax = a; }
-      float qinv = 127.f / qmax;
-      for (int i = 0; i < Dh; i++) {
-        int q8 = (int)lrintf(qh[i] * qinv);
-        s->q8[i] = (int8_t)(q8 > 127 ? 127 : (q8 < -127 ? -127 : q8));
-      }
-      for (int i = Dh; i < LLM_KPAD; i++) s->q8[i] = 0;
-      float qs = qmax / 127.f * scale;
-      const int8_t *kb = s->k8 + ((size_t)l * S * H + hh) * LLM_KPAD;
-      const float *ksb = s->ks + (size_t)l * S * H + hh;
-      const float *vsb = s->vs + (size_t)l * S * H + hh;
-      float maxs = -1e30f;
-      for (int t = 0; t <= pos; t++) {
-        float dot = (float)LLM_DOT_S8V(s->q8, kb + (size_t)t * H * LLM_KPAD, nk)
-                    * qs * ksb[(size_t)t * H];
-        s->scores[t] = dot;
-        if (dot > maxs) maxs = dot;
-      }
-      // softmax weights, each multiplied by its position's value scale, to int16
-      float denom = 0.f, wmax = 0.f;
-      for (int t = 0; t <= pos; t++) {
-        float w = expf(s->scores[t] - maxs);
-        denom += w;
-        float wv = w * vsb[(size_t)t * H];
-        s->scores[t] = wv;
-        if (wv > wmax) wmax = wv;
-      }
-      float winv = 32767.f / wmax;
-      for (int t = 0; t <= pos; t++) s->w16[t] = (int16_t)lrintf(s->scores[t] * winv);
-      for (int t = pos + 1; t < n16 * 8; t++) s->w16[t] = 0;
-      float os = wmax / 32767.f / denom;
-      const int16_t *vt = s->v16t + ((size_t)l * H + hh) * Dh * S;
-      for (int i = 0; i < Dh; i++)
-        ao[i] = (float)LLM_DOT_S16V(vt + (size_t)i * S, s->w16, n16) * os;
-    }
+    if (m->attn_heads) m->attn_heads(m, s, l, pos);
+    else llm_attend_heads(m, s, l, pos, 0, H, s->q8, s->w16, s->scores);
 #else
     float *kc = s->kcache + (size_t)l * S * D, *vc = s->vcache + (size_t)l * S * D;
     memcpy(kc + (size_t)pos * D, k, D * sizeof(float));
     memcpy(vc + (size_t)pos * D, v, D * sizeof(float));
     // causal attention over 0..pos
+    float scale = 1.f / sqrtf((float)Dh);
     for (int hh = 0; hh < H; hh++) {
       float *qh = q + hh * Dh;
       float *ao = s->att + hh * Dh;

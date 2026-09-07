@@ -116,6 +116,10 @@ static const int8_t *job_xq;
 static float job_xs;
 static float *job_y;
 static int job_split;
+// Attention job: the worker takes heads [0, job_h) of layer job_l at job_pos.
+static int job_l, job_pos, job_h;
+enum { JOB_MATVEC, JOB_ATTN };
+static int job_kind = JOB_MATVEC;
 
 #if LLM_HAVE_PIE
 // The head's activations in the layout the int4 kernel reads, built once per
@@ -137,10 +141,29 @@ static void matvec_rows(const QT *t, const int8_t *xq, float xs, float *y,
 static void worker_main(void *) {
   for (;;) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    matvec_rows(job_t, job_xq, job_xs, job_y, 0, job_split);
+#ifdef LLM_KV_QUANT
+    if (job_kind == JOB_ATTN)
+      llm_attend_heads(&model, &s, job_l, job_pos, 0, job_h, s.q8b, s.w16b, s.scoresb);
+    else
+#endif
+      matvec_rows(job_t, job_xq, job_xs, job_y, 0, job_split);
     xTaskNotifyGive(main_h);
   }
 }
+
+#ifdef LLM_KV_QUANT
+// Heads are independent: the worker core takes the first half with its own
+// temporaries while this core takes the rest, each writing its own slice of
+// s.att.
+static void attn_par(Model *m, Scratch *sc, int l, int pos) {
+  int H = m->c.n_heads;
+  job_kind = JOB_ATTN; job_l = l; job_pos = pos; job_h = H / 2;
+  xTaskNotifyGive(worker_h);
+  llm_attend_heads(m, sc, l, pos, H / 2, H, sc->q8, sc->w16, sc->scores);
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  job_kind = JOB_MATVEC;
+}
+#endif
 
 // Quantize x into the shared activation buffer. The vector kernel reads the
 // row's padded width, so the bytes past cols are cleared every call: the
@@ -467,6 +490,9 @@ void setup() {
     // After the worker exists: matvec_par notifies worker_h.
     model.layer_matvec = matvec_par;
     model.head_matvec  = matvec_par;
+#ifdef LLM_KV_QUANT
+    model.attn_heads = attn_par;
+#endif
   } else {
     Serial.println("dual-core worker failed; running single core");
   }
@@ -490,9 +516,10 @@ void setup() {
 #else
   const char *kv_mode = "fp32";
 #endif
-  Serial.printf("sampling: temperature %.2f, top-k %d | matvec: %s | head: %s | kv cache: %s\n\n",
+  Serial.printf("sampling: temperature %.2f, top-k %d | matvec: %s | head: %s | kv cache: %s | attention: %s\n\n",
                 TEMPERATURE, TOP_K, LLM_HAVE_PIE ? "PIE vector" : "scalar",
-                model.out_head.w4 ? "int4, vector unpack" : "int8", kv_mode);
+                model.out_head.w4 ? "int4, vector unpack" : "int8", kv_mode,
+                model.attn_heads ? "both cores" : "one core");
   Serial.println("type a story prompt and press return.");
   // A UART bridge can deliver a glitch byte around reset. Anything received
   // before this point is not a prompt, so drop it rather than let it poison
