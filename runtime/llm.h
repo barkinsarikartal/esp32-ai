@@ -543,28 +543,49 @@ static void llm_profile_reset(Scratch *s) {
 #endif
 
 #ifdef LLM_KV_QUANT
-/* One allocation holds every quantized-cache buffer; the caller places it
- * (host: malloc, device: PSRAM or SRAM). Sized with slack for alignment. */
-static inline size_t llm_kv_quant_bytes(const Model *m) {
-  size_t L = m->c.n_layers, S = m->c.seq_len, H = m->c.n_heads, Dh = m->c.dim / m->c.n_heads;
-  return L * S * H * LLM_KPAD + L * H * Dh * S * sizeof(int16_t)
-       + 2 * L * S * H * sizeof(float)
-       + 2 * (LLM_KPAD + S * sizeof(int16_t)) + S * sizeof(float) + 96;
+/* The quantized cache is three placements, because they are read at very
+ * different rates and a device can afford fast memory for the small ones:
+ *   key   the int8 keys, one 32-byte row per position and head: read for
+ *         every position at every step, the hottest part of the cache;
+ *   hot   the per-head temporaries (two sets, for two cores);
+ *   main  the transposed int16 values and both scale arrays.
+ * llm_kv_quant_bind takes a buffer for each; a NULL key or hot buffer is
+ * carved out of main instead, in which case main must be sized with
+ * llm_kv_quant_bytes (the sum of all three). Sizes include alignment slack. */
+static inline size_t llm_kv_key_bytes(const Model *m) {
+  return (size_t)m->c.n_layers * m->c.seq_len * m->c.n_heads * LLM_KPAD + 16;
 }
-static inline void llm_kv_quant_bind(const Model *m, Scratch *s, void *buffer) {
+static inline size_t llm_kv_hot_bytes(const Model *m) {
+  size_t S = m->c.seq_len;
+  return 2 * (LLM_KPAD + S * sizeof(int16_t)) + S * sizeof(float) + 48;
+}
+static inline size_t llm_kv_main_bytes(const Model *m) {
   size_t L = m->c.n_layers, S = m->c.seq_len, H = m->c.n_heads, Dh = m->c.dim / m->c.n_heads;
-  uint8_t *p = (uint8_t *)(((uintptr_t)buffer + 15) & ~(uintptr_t)15);
-  s->k8 = (int8_t *)p;    p += L * S * H * LLM_KPAD;           /* 32-byte rows */
+  return L * H * Dh * S * sizeof(int16_t) + 2 * L * S * H * sizeof(float) + 16;
+}
+static inline size_t llm_kv_quant_bytes(const Model *m) {
+  return llm_kv_main_bytes(m) + llm_kv_key_bytes(m) + llm_kv_hot_bytes(m);
+}
+static inline uint8_t *llm_align16(void *p) {
+  return (uint8_t *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
+}
+static inline void llm_kv_quant_bind(const Model *m, Scratch *s, void *main_buf,
+                                     void *key_buf, void *hot_buf) {
+  size_t L = m->c.n_layers, S = m->c.seq_len, H = m->c.n_heads, Dh = m->c.dim / m->c.n_heads;
+  uint8_t *p = llm_align16(main_buf);
   s->v16t = (int16_t *)p; p += L * H * Dh * S * sizeof(int16_t); /* S*2-byte rows */
   s->ks = (float *)p;     p += L * S * H * sizeof(float);
   s->vs = (float *)p;     p += L * S * H * sizeof(float);
-  p = (uint8_t *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
-  s->q8 = (int8_t *)p;    p += LLM_KPAD;
-  s->w16 = (int16_t *)p;  p += S * sizeof(int16_t);
-  p = (uint8_t *)(((uintptr_t)p + 15) & ~(uintptr_t)15);
-  s->q8b = (int8_t *)p;   p += LLM_KPAD;
-  s->w16b = (int16_t *)p; p += S * sizeof(int16_t);
-  s->scoresb = (float *)p;
+  uint8_t *k = llm_align16(key_buf ? key_buf : p);
+  s->k8 = (int8_t *)k;    k += L * S * H * LLM_KPAD;              /* 32-byte rows */
+  if (!key_buf) p = k;
+  uint8_t *h = llm_align16(hot_buf ? hot_buf : p);
+  s->q8 = (int8_t *)h;    h += LLM_KPAD;
+  s->w16 = (int16_t *)h;  h += S * sizeof(int16_t);
+  h = llm_align16(h);
+  s->q8b = (int8_t *)h;   h += LLM_KPAD;
+  s->w16b = (int16_t *)h; h += S * sizeof(int16_t);
+  s->scoresb = (float *)h;
 }
 
 /* Attention over heads h0..h1-1 of one layer at one position, on the

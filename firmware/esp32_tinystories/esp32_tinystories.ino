@@ -281,8 +281,13 @@ static void alloc_scratch() {
   // rather than spend a fifth of internal SRAM on it.
   s.logits = (float *)ps_or_die((size_t)model.out_vocab * 4, "logits");
 #ifdef LLM_KV_QUANT
-  // Quantized KV cache: int8 keys, int16 transposed values, about 540 KB.
-  llm_kv_quant_bind(&model, &s, ps_or_die(llm_kv_quant_bytes(&model), "kv cache"));
+  // Quantized KV cache. The int8 keys (192 KB) are read for every position at
+  // every step, so they go to internal SRAM with the per-head temporaries;
+  // the int16 values and the scales (about 340 KB) stay in PSRAM.
+  llm_kv_quant_bind(&model, &s,
+                    ps_or_die(llm_kv_main_bytes(&model), "kv values"),
+                    sram_or_die(llm_kv_key_bytes(&model), "kv keys"),
+                    sram_or_die(llm_kv_hot_bytes(&model), "kv temporaries"));
   s.kcache = s.vcache = NULL;
 #else
   // KV cache: 1.1MB, read once per position rather than per matvec.

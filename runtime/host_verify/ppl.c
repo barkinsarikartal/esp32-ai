@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
   s.logits = malloc(V*4); s.scores = malloc(S*4);
   s.kcache = malloc((size_t)L*S*D*4); s.vcache = malloc((size_t)L*S*D*4);
 #ifdef LLM_KV_QUANT
-  llm_kv_quant_bind(&m, &s, malloc(llm_kv_quant_bytes(&m)));
+  llm_kv_quant_bind(&m, &s, malloc(llm_kv_quant_bytes(&m)), NULL, NULL);
 #endif
 
   size_t vn; uint16_t *val = (uint16_t *)read_file(valp, &vn);
