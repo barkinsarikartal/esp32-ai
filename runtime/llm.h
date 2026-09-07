@@ -44,6 +44,11 @@ typedef struct {
   int stride8;             // bytes per staged row: cols rounded up to
                            // LLM_STAGE_ALIGN, so a SIMD kernel can read whole
                            // vectors without a tail case
+  /* Optional int4 staging: the packed nibbles copied as they are, with the
+   * group scales converted once. Half the bytes of int8 staging, for a
+   * kernel that unpacks nibbles in registers. NULL unless staged this way. */
+  const uint8_t *w4;       // rows*stride4 packed nibbles, same layout as codes
+  int stride4;             // bytes per staged row, = row_bytes
 } QT;
 
 /* Staged rows are padded to this many bytes. 1 keeps rows contiguous, which
@@ -113,6 +118,7 @@ static const uint8_t *bind_q(const uint8_t *p, QT *t, int rows, int cols) {
   t->scales = (const uint16_t *)p;  p += (size_t)rows * t->n_groups * 2;
   t->w8 = NULL; t->scale8 = NULL;   // int4 path until staged
   t->stride8 = 0;
+  t->w4 = NULL; t->stride4 = 0;
   return p;
 }
 static const uint8_t *bind_f(const uint8_t *p, const float **t, int n) {
@@ -445,6 +451,28 @@ static inline void llm_stage_int8(QT *t, void *buffer) {
   t->w8 = w;
   t->scale8 = sc;
   t->stride8 = stride;
+}
+
+/* ---- int4 staging -----------------------------------------------------
+ * A straight copy of the packed codes out of flash into faster memory, plus
+ * float scales. The bytes are the same nibbles matvec_q8_range reads, so that
+ * function stays the scalar reference for any kernel using this staging. */
+static inline size_t llm_stage_int4_bytes(const QT *t) {
+  size_t w_bytes = (size_t)t->rows * t->row_bytes;
+  return ((w_bytes + sizeof(float) - 1) & ~(size_t)(sizeof(float) - 1))
+       + (size_t)t->rows * t->n_groups * sizeof(float);
+}
+static inline void llm_stage_int4(QT *t, void *buffer) {
+  size_t w_bytes = (size_t)t->rows * t->row_bytes;
+  uint8_t *w = (uint8_t *)buffer;
+  float *sc = (float *)((uint8_t *)buffer
+                        + ((w_bytes + sizeof(float) - 1) & ~(size_t)(sizeof(float) - 1)));
+  memcpy(w, t->codes, w_bytes);
+  for (size_t i = 0; i < (size_t)t->rows * t->n_groups; i++)
+    sc[i] = half2float(t->scales[i]);
+  t->w4 = w;
+  t->stride4 = t->row_bytes;
+  t->scale8 = sc;
 }
 
 /* Stage every per-position tensor, one allocation per tensor: a multi-megabyte

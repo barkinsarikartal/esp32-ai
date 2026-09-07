@@ -117,10 +117,18 @@ static float job_xs;
 static float *job_y;
 static int job_split;
 
+#if LLM_HAVE_PIE
+// The head's activations in the layout the int4 kernel reads, built once per
+// matvec by quantize_shared (both cores read them).
+static int8_t xperm_shared[LLM_Q8_MAX_INPUT] __attribute__((aligned(16)));
+static int32_t xsum8_shared[LLM_Q8_MAX_INPUT / 32 + 1];
+#endif
+
 // Ranged int8 matvec for one staged tensor on the calling core.
 static void matvec_rows(const QT *t, const int8_t *xq, float xs, float *y,
                         int row_begin, int row_end) {
 #if LLM_HAVE_PIE
+  if (llm_pie4_ok(t)) { matvec_pie4_range(t, xperm_shared, xsum8_shared, xs, y, row_begin, row_end); return; }
   if (llm_pie_ok(t)) { matvec_pie_range(t, xq, xs, y, row_begin, row_end); return; }
 #endif
   matvec_i8_range(t, xq, xs, y, row_begin, row_end);
@@ -142,11 +150,14 @@ static float quantize_shared(const QT *t, const float *x) {
   float xs;
   quantize_act(x, t->cols, xq_shared, &xs);
   for (int j = t->cols; j < t->stride8; j++) xq_shared[j] = 0;
+#if LLM_HAVE_PIE
+  if (t->w4) llm_pie4_prepare(xq_shared, t->cols, t->group, xperm_shared, xsum8_shared);
+#endif
   return xs;
 }
 
 static void matvec_par(const QT *t, const float *x, float *y) {
-  if (t->w8 == NULL) { MATVEC(t, x, y); return; }
+  if (t->w8 == NULL && t->w4 == NULL) { MATVEC(t, x, y); return; }
   float xs = quantize_shared(t, x);      // once; both cores read the result
   if (t->rows < 128) { matvec_rows(t, xq_shared, xs, y, 0, t->rows); return; }
   job_t = t; job_xq = xq_shared; job_xs = xs; job_y = y; job_split = t->rows / 2;
@@ -166,12 +177,17 @@ static bool pie_self_check() {
   double worst = 0;
   for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
     const QT *t = cases[c];
-    if (!llm_pie_ok(t)) { Serial.printf("pie: tensor %u not eligible\n", c); return false; }
     for (int j = 0; j < t->cols; j++) x[j] = sinf(0.37f * j + c) * 1.7f;
     float xs = quantize_shared(t, x);
     int rows = t->rows < 1024 ? t->rows : 1024;
-    matvec_i8_range(t, xq_shared, xs, ref, 0, rows);
-    matvec_pie_range(t, xq_shared, xs, got, 0, rows);
+    if (llm_pie4_ok(t)) {
+      // int4 staging: the reference is the scalar walk of the same nibbles.
+      matvec_q8_range(t, xq_shared, xs, ref, 0, rows);
+      matvec_pie4_range(t, xperm_shared, xsum8_shared, xs, got, 0, rows);
+    } else if (llm_pie_ok(t)) {
+      matvec_i8_range(t, xq_shared, xs, ref, 0, rows);
+      matvec_pie_range(t, xq_shared, xs, got, 0, rows);
+    } else { Serial.printf("pie: tensor %u not eligible\n", c); return false; }
     for (int r = 0; r < rows; r++) {
       double d = fabs((double)ref[r] - got[r]);
       if (d > worst) worst = d;
@@ -424,7 +440,16 @@ void setup() {
     while (1) delay(1000);
   }
   // The tied head is read per token, not per position, so the core helper does
-  // not walk it. Stage it too: it is 85%% of the dense MACs.
+  // not walk it. Stage it too: it is 85%% of the dense MACs. With the vector
+  // unit it stays int4 and is unpacked in registers: the head is bound by
+  // PSRAM bandwidth, so half the bytes is the win.
+#if LLM_HAVE_PIE
+  if (model.out_head.cols % 32 == 0 && model.out_head.group % 32 == 0) {
+    void *b = ps_or_die(llm_stage_int4_bytes(&model.out_head), "staged head int4");
+    llm_stage_int4(&model.out_head, b);
+    ++staged;
+  } else
+#endif
   {
     void *b = ps_or_die(llm_stage_int8_bytes(&model.out_head), "staged head");
     llm_stage_int8(&model.out_head, b);
@@ -465,8 +490,9 @@ void setup() {
 #else
   const char *kv_mode = "fp32";
 #endif
-  Serial.printf("sampling: temperature %.2f, top-k %d | matvec: %s | kv cache: %s\n\n",
-                TEMPERATURE, TOP_K, LLM_HAVE_PIE ? "PIE vector" : "scalar", kv_mode);
+  Serial.printf("sampling: temperature %.2f, top-k %d | matvec: %s | head: %s | kv cache: %s\n\n",
+                TEMPERATURE, TOP_K, LLM_HAVE_PIE ? "PIE vector" : "scalar",
+                model.out_head.w4 ? "int4, vector unpack" : "int8", kv_mode);
   Serial.println("type a story prompt and press return.");
   // A UART bridge can deliver a glitch byte around reset. Anything received
   // before this point is not a prompt, so drop it rather than let it poison

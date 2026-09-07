@@ -65,6 +65,43 @@ static inline int64_t llm_pie_dot_s16v(const int16_t *a_in, const int16_t *b_in,
     : [lo] "=&r"(lo), [hi] "=&r"(hi), [a] "+&r"(a), [b] "+&r"(b), [n] "+&r"(n) :: "memory");
   return ((int64_t)(int8_t)(hi & 0xFF) << 32) | (int64_t)lo;
 }
+// Dot product of nchunk chunks of 32 packed int4 weights against int8
+// activations laid out to match the unpacking: for each chunk, the 16
+// activations at even indices then the 16 at odd indices (llm_pie4_prepare).
+// A 16-byte load of packed bytes gives the even weights in the low nibbles
+// and the odd weights in the high nibbles; AND with 0x0F and a 4-bit shift of
+// each 32-bit lane followed by the same AND separate them. The codes are
+// used as they are (0..15): the caller subtracts 8 * sum(x), which is what
+// makes the result identical to (code - 8) * x. nchunk >= 1.
+static inline int32_t llm_pie_dot4(const uint8_t *w_in, const int8_t *xp_in,
+                                   int nchunk, const uint8_t *mask16) {
+  register const uint8_t *w __asm__("a2") = w_in;
+  register const int8_t *x __asm__("a3") = xp_in;
+  register int n __asm__("a4") = nchunk;
+  register int32_t acc __asm__("a5");
+  register const uint8_t *mk __asm__("a0") = mask16;
+  register int sar __asm__("a1") = 4;
+  __asm__ volatile(
+    "esp.movx.w.sar %[sar]\n"
+    "esp.vld.128.ip q6, %[mk], 0\n"
+    "esp.zero.xacc\n"
+    "1:\n"
+    "esp.vld.128.ip q0, %[w], 16\n"
+    "esp.vld.128.ip q4, %[x], 16\n"
+    "esp.vld.128.ip q5, %[x], 16\n"
+    "esp.andq q2, q0, q6\n"
+    "esp.vsr.u32 q3, q0\n"
+    "esp.andq q3, q3, q6\n"
+    "esp.vmulas.s8.xacc q2, q4\n"
+    "esp.vmulas.s8.xacc q3, q5\n"
+    "addi %[n], %[n], -1\n"
+    "bnez %[n], 1b\n"
+    "esp.movx.r.xacc.l %[acc]\n"
+    : [acc] "=&r"(acc), [w] "+&r"(w), [x] "+&r"(x), [n] "+&r"(n), [mk] "+&r"(mk)
+    : [sar] "r"(sar)
+    : "memory");
+  return acc;
+}
 #else
 #define LLM_HAVE_PIE 0
 #endif
